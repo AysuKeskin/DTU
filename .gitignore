@@ -1,0 +1,35 @@
+# Python sanal ortamı
+venv/
+.env/
+
+# Derlenmiş Python dosyaları
+__pycache__/
+*.py[cod]
+
+# Büyük model ağırlıkları
+*.pt
+backend/yolov8*.pt
+backend/yolov11*.pt
+backend/yolov8*.onnx
+backend/yolov11*.onnx
+backend/yolov8*-seg.onnx
+backend/yolov11*-seg.onnx
+backend/yolov8x-seg.pt
+# Model weights
+backend/yolov8l-seg.pt
+backend/yolov8m-seg.pt
+backend/yolov8x-seg.pt
+
+# ONNX Runtime & Torch binaries
+venv/lib/python3.10/site-packages/onnxruntime/capi/*.dylib
+venv/lib/python3.10/site-packages/onnxruntime/capi/*.so
+venv/lib/python3.10/site-packages/torch/lib/*.dylib
+# ONNX Runtime kütüphaneleri
+venv/lib/python3.10/site-packages/onnxruntime/capi/*.dylib
+venv/lib/python3.10/site-packages/onnxruntime/capi/*.so
+venv/lib/python3.10/site-packages/onnxruntime/capi/libonnxruntime.1.22.1.dylib
+venv/lib/python3.10/site-packages/onnxruntime/capi/libonnxruntime.1.22.1.so
+
+# Geçici dosyalar
+*.log
+*.tmp
