@@ -223,7 +223,7 @@ try:
             test_array = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
             test_image = Image.fromarray(test_array)
             
-            # Test multiple confidence levels  
+            # Test multiple confidence levels
             for conf in [0.25, 0.5, 0.7]:
                 test_start = time.time()
                 detections = onnx_model.predict(test_image, conf_threshold=conf)
@@ -232,13 +232,12 @@ try:
             
             logger.info(f"🔥 Comprehensive ONNX warmup completed in {warmup_time:.2f}s")
             logger.info(f"✅ ONNX model is fully optimized and ready for production use!")
-            
         except Exception as warmup_error:
             logger.warning(f"⚠️ ONNX model warmup failed: {warmup_error}, but model is loaded")
         
     else:
         raise Exception("Failed to load ONNX model")
-        
+    
     logger.info("✅ Backend initialization complete - ready to accept requests!")
         
 except Exception as e:
@@ -329,7 +328,7 @@ async def detect_fish(
                 class_name=detection["class_name"],
                 confidence=detection["confidence"],
                 bbox=detection["bbox"],
-                measurements={
+                        measurements={
                     "length": (detection["bbox"]["x2"] - detection["bbox"]["x1"]) * 0.1,
                     "width": (detection["bbox"]["y2"] - detection["bbox"]["y1"]) * 0.1,
                     "area": (detection["bbox"]["x2"] - detection["bbox"]["x1"]) * (detection["bbox"]["y2"] - detection["bbox"]["y1"]) * 0.01
@@ -603,7 +602,7 @@ async def video_stream():
     )
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, confidence: float = 0.3, iou_threshold: float = 0.2):
+async def websocket_endpoint(websocket: WebSocket):
     """
     WEBSOCKET ENDPOINT FOR REAL-TIME DETECTION
     ==========================================
@@ -614,6 +613,12 @@ async def websocket_endpoint(websocket: WebSocket, confidence: float = 0.3, iou_
     - OPTIMIZED FOR MAXIMUM SPEED: Reduced logging, FPS monitoring
     """
     await websocket.accept()
+    
+    # Parse query parameters from WebSocket URL
+    query_params = websocket.query_params
+    confidence = float(query_params.get('confidence', 0.6))
+    iou_threshold = float(query_params.get('iou_threshold', 0.7))
+    
     logger.info(f"🔌 WebSocket connected for real-time detection with confidence: {confidence}, IoU: {iou_threshold}")
     
     # PERFORMANCE MONITORING: Initialize counters
@@ -638,15 +643,16 @@ async def websocket_endpoint(websocket: WebSocket, confidence: float = 0.3, iou_
                     # Note: frame is in BGR format from OpenCV, model will convert it properly
                     
                     # Run FAST live detection optimized for streaming (non-blocking)
-                    # Use asyncio.run_in_executor to prevent blocking the event loop
-                    detections = await asyncio.get_event_loop().run_in_executor(
-                        None,  # Use default executor
-                        onnx_model.fast_live_detect,
-                        frame,  # Pass BGR frame (model will convert to RGB)
-                        confidence,
-                        iou_threshold,
-                        50  # max_detections
+                    # Use the async method directly
+                    # Convert to RGB exactly as in your image endpoint
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    detections = await onnx_model.fast_live_detect_async(
+                        rgb_frame, 
+                        conf_threshold=confidence,
+                        iou_threshold=iou_threshold,
+                        max_detections=5  # Limit max detections to prevent duplicates
                     )
+
                     
                     # PERFORMANCE OPTIMIZATION: Reduced logging frequency
                     # Only log every 30 frames to avoid performance impact
@@ -659,14 +665,22 @@ async def websocket_endpoint(websocket: WebSocket, confidence: float = 0.3, iou_
                     # Convert detections to streaming format (masks only)
                     streaming_detections = []
                     for detection in detections:
+                        # Only include necessary data for mask drawing
                         streaming_detection = {
-                            "id": detection["id"],
                             "class_name": detection["class_name"],
                             "confidence": detection["confidence"],
                             "mask": detection["mask"],
-                            "image_size": detection["image_size"]
+                            "image_size": {"width": frame.shape[1], "height": frame.shape[0]}
                         }
                         streaming_detections.append(streaming_detection)
+                    
+                    # Debug: Log mask information
+                    mask_count = sum(1 for det in streaming_detections if det["mask"] is not None)
+                    if len(streaming_detections) > 0:
+                        logger.info(f"🎭 WebSocket sending {len(streaming_detections)} detections, {mask_count} with masks")
+                        for i, det in enumerate(streaming_detections[:3]):  # Log first 3
+                            mask_info = f"mask: {len(det['mask'])} points" if det['mask'] else "no mask"
+                            logger.info(f"  Detection {i}: {det['class_name']} ({det['confidence']:.2f}) - {mask_info}")
                     
                     # Send detection results back immediately
                     response_data = {
@@ -867,7 +881,7 @@ async def force_detect():
 # =============================================================================
 
 @app.websocket("/ws-video")
-async def video_websocket_endpoint(websocket: WebSocket, confidence: float = 0.3, iou_threshold: float = 0.2):
+async def video_websocket_endpoint(websocket: WebSocket):
     """
     VIDEO DETECTION WEBSOCKET
     =======================
@@ -877,6 +891,12 @@ async def video_websocket_endpoint(websocket: WebSocket, confidence: float = 0.3
     - Maintains video context between frames
     """
     await websocket.accept()
+    
+    # Parse query parameters from WebSocket URL
+    query_params = websocket.query_params
+    confidence = float(query_params.get('confidence', 0.3))
+    iou_threshold = float(query_params.get('iou_threshold', 0.2))
+    
     logger.info(f"🎬 Video WebSocket connected with confidence: {confidence}, IoU: {iou_threshold}")
     
     try:
@@ -899,25 +919,25 @@ async def video_websocket_endpoint(websocket: WebSocket, confidence: float = 0.3
                     # Note: frame is in BGR format from OpenCV, model will convert it properly
                     
                     # Run FAST live detection for video streaming (non-blocking)
-                    # Use asyncio.run_in_executor to prevent blocking the event loop
-                    detections = await asyncio.get_event_loop().run_in_executor(
-                        None,  # Use default executor
-                        onnx_model.fast_live_detect,
-                        frame,  # Pass BGR frame (model will convert to RGB)
-                        confidence,
-                        iou_threshold,
-                        50  # max_detections
+                    # Use the async method directly
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    detections = await onnx_model.fast_live_detect_async(
+                        rgb_frame, 
+                        conf_threshold=confidence, 
+                        iou_threshold=iou_threshold, 
+                        max_detections=50
                     )
                     
-                    # Log detection count every 30 frames
+                            # Log detection count every 30 frames
                     if frame_count % 30 == 0:
                         logger.info(f"🎬 Video frame {frame_count}: {len(detections)} detections")
+                    # Convert detections to video format
                     
                     # Convert detections to video format
                     video_detections = []
                     for i, detection in enumerate(detections):
                         video_detection = {
-                            "id": f"det_{frame_count}_{i}",
+                                    "id": f"det_{frame_count}_{i}",
                             "class_name": detection["class_name"],
                             "confidence": detection["confidence"],
                             "bbox": detection["bbox"],
@@ -1038,7 +1058,7 @@ async def detect_video(
                 frame_detections = video_processor.process_frame(frame)
                 detections_per_frame.append(frame_detections)
                 processed_frames += 1
-                
+                    
                 # Log progress periodically
                 if processed_frames % 10 == 0:
                     logger.info(f"📊 Processed {processed_frames}/{frames_to_process} frames - Found {len(frame_detections)} tracked objects")

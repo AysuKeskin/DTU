@@ -5,6 +5,7 @@ from PIL import Image
 from typing import List, Tuple
 import logging
 import asyncio
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -68,158 +69,161 @@ class SimpleONNXModel:
         logger.info(f"🎯 Using providers: {self.session.get_providers()}")
         logger.info(f"⚡ Pre-allocated buffers for zero-copy inference")
     
-    async def fast_live_detect_async(self, image, conf_threshold: float = 0.2, max_detections: int = 50) -> List[dict]:
+    async def fast_live_detect_async(self, image, conf_threshold: float = 0.2, iou_threshold: float = 0.4, max_detections: int = 50) -> List[dict]:
         """
-        ASYNC ULTRA-FAST live detection optimized for real-time streaming
-        
-        Optimizations:
-        - Async inference (non-blocking WebSocket)
-        - GPU acceleration (CUDA/CoreML)
-        - IOBinding for zero-copy
-        - Pre-allocated buffers
-        - Thresholding before sigmoid
-        - No mask generation
-        - Simplified NMS
+        ASYNC live detection + segmentation masks
+        - GPU + IOBinding + pre-alloc buffers
+        - Only generates masks, no bounding boxes for better performance
         """
         try:
-            # Handle input types
+            # 1) load & prep
             if isinstance(image, Image.Image):
                 img = np.array(image)
             elif isinstance(image, np.ndarray):
                 img = image
             else:
-                raise ValueError(f"Unsupported image type: {type(image)}")
-            
-            original_h, original_w = img.shape[:2]
-            
-            # FAST PREPROCESSING: Write directly to pre-allocated buffer
-            img_resized = cv2.resize(img, (640, 640), interpolation=cv2.INTER_LINEAR)
-            img_norm = img_resized.astype(np.float32) / 255.0
-            np.copyto(self.input_buffer[0], np.transpose(img_norm, (2, 0, 1)))
-            
-            # ASYNC GPU INFERENCE: Non-blocking WebSocket thread
+                raise ValueError(f"Unsupported type {type(image)}")
+            h0, w0 = img.shape[:2]
+
+            # 2) resize & normalize into our buffer
+            small = cv2.resize(img, (640, 640), interpolation=cv2.INTER_LINEAR)
+            norm = small.astype(np.float32) / 255.0
+            np.copyto(self.input_buffer[0], np.transpose(norm, (2,0,1)))
+
+            # 3) GPU inference
             loop = asyncio.get_event_loop()
-            outputs = await loop.run_in_executor(
-                None, 
-                self._run_inference_optimized, 
-                self.input_buffer
-            )
-            
-            # FAST POSTPROCESSING: Extract only what we need
-            detections = outputs[0][0].T
-            boxes = detections[:, :4]
-            class_scores = detections[:, 4:84]
-            
-            # OPTIMIZATION: Threshold before sigmoid (avoid exp on large arrays)
-            max_scores = np.max(class_scores, axis=1)
-            
-            # Convert confidence threshold to logit threshold
-            logit_threshold = -np.log(1/conf_threshold - 1) if conf_threshold > 0 and conf_threshold < 1 else 0
-            valid_indices = max_scores > logit_threshold
-            
-            if np.sum(valid_indices) == 0:
+            outputs = await loop.run_in_executor(None, self._run_inference_optimized, self.input_buffer)
+
+            # 4) Process outputs
+            preds = outputs[0][0].T  # (anchors,116)
+            class_scores = preds[:, 4:84]  # (anchors, 80)
+            mask_coeffs_raw = preds[:, 84:]  # (anchors, 32+)
+            proto = outputs[1][0] if len(outputs)>1 else None  # (32,160,160)
+
+            # 5) Calculate confidences and filter
+            class_scores_sigmoid = 1 / (1 + np.exp(-class_scores))
+            confidences = np.max(class_scores_sigmoid, axis=1)
+            class_ids = np.argmax(class_scores_sigmoid, axis=1)
+
+            # Filter by confidence
+            valid_indices = confidences > conf_threshold
+            if not valid_indices.any():
                 return []
+
+            # Get valid detections
+            valid_scores = confidences[valid_indices]
+            valid_class_ids = class_ids[valid_indices]
+            valid_boxes = preds[valid_indices, :4]  # Get bounding boxes for NMS
             
-            # Apply sigmoid only to valid detections
-            valid_scores = max_scores[valid_indices]
-            confidences_sigmoid = 1 / (1 + np.exp(-valid_scores))
-            
-            # LIMIT DETECTIONS: Keep only top N for speed
-            if len(confidences_sigmoid) > max_detections:
-                top_indices = np.argsort(confidences_sigmoid)[-max_detections:]
-                temp_indices = np.where(valid_indices)[0]
-                valid_indices = np.zeros_like(valid_indices, dtype=bool)
-                valid_indices[temp_indices[top_indices]] = True
-                confidences_sigmoid = confidences_sigmoid[top_indices]
-            
-            valid_boxes = boxes[valid_indices]
-            valid_class_scores = class_scores[valid_indices]
-            
-            # Get class IDs
-            class_ids = np.argmax(valid_class_scores, axis=1)
-            
-            # FAST COORDINATE CONVERSION: Use pre-allocated buffer
+            # Convert YOLO format to x1,y1,x2,y2 for NMS
             x_center, y_center, width, height = valid_boxes.T
-            scale_x, scale_y = original_w / 640, original_h / 640
+            scale_x, scale_y = w0 / 640, h0 / 640
             
-            # Write to pre-allocated coordinate buffer
-            self.coord_buffer[:len(valid_boxes), 0] = np.clip(((x_center - width / 2) * scale_x), 0, original_w)
-            self.coord_buffer[:len(valid_boxes), 1] = np.clip(((y_center - height / 2) * scale_y), 0, original_h)
-            self.coord_buffer[:len(valid_boxes), 2] = np.clip(((x_center + width / 2) * scale_x), 0, original_w)
-            self.coord_buffer[:len(valid_boxes), 3] = np.clip(((y_center + height / 2) * scale_y), 0, original_h)
+            x1 = ((x_center - width / 2) * scale_x)
+            y1 = ((y_center - height / 2) * scale_y)
+            x2 = ((x_center + width / 2) * scale_x)
+            y2 = ((y_center + height / 2) * scale_y)
             
-            # OPTIMIZATION: Filter small boxes before NMS
-            box_areas = (self.coord_buffer[:len(valid_boxes), 2] - self.coord_buffer[:len(valid_boxes), 0]) * \
-                       (self.coord_buffer[:len(valid_boxes), 3] - self.coord_buffer[:len(valid_boxes), 1])
-            area_mask = box_areas >= 100  # Minimum 100 pixels
+            boxes_for_nms = np.column_stack([x1, y1, x2, y2])
             
-            if not np.any(area_mask):
-                return []
-            
-            # Apply area filter
-            valid_coords = self.coord_buffer[:len(valid_boxes)][area_mask]
-            valid_confidences = confidences_sigmoid[area_mask]
-            valid_class_ids = class_ids[area_mask]
-            
-            # SIMPLIFIED NMS: Fast overlap removal
-            boxes_for_nms = valid_coords.astype(np.float32)
-            
-            indices = cv2.dnn.NMSBoxes(
+            # Apply NMS to remove duplicates based on IoU threshold
+            nms_indices = cv2.dnn.NMSBoxes(
                 boxes_for_nms.tolist(),
-                valid_confidences.tolist(),
-                conf_threshold,
-                0.4  # IoU threshold
+                valid_scores.tolist(),
+                score_threshold=0.0001,  # Very low since we already filtered
+                nms_threshold=iou_threshold
             )
             
-            if len(indices) == 0:
+            if len(nms_indices) == 0:
                 return []
             
-            top_indices = indices.flatten()
+            nms_indices = nms_indices.flatten()
             
-            # BUILD RESULTS: No masks for speed
-            live_detections = []
-            for idx, i in enumerate(top_indices):
-                x1, y1, x2, y2 = valid_coords[i]
-                
-                detection = {
-                    "id": f"live_{idx}",
-                    "class_name": self.class_names.get(valid_class_ids[i], f"class_{valid_class_ids[i]}"),
-                    "confidence": float(valid_confidences[i]),
-                    "bbox": {
-                        "x1": int(x1), "y1": int(y1), 
-                        "x2": int(x2), "y2": int(y2)
-                    },
-                    "mask": None,  # No masks for live detection speed
-                    "image_size": {"width": original_w, "height": original_h}
+            # Limit mask coefficients to match prototype dimensions
+            if mask_coeffs_raw.shape[1] > 32:
+                mask_coeffs = mask_coeffs_raw[:, :32]
+            else:
+                mask_coeffs = mask_coeffs_raw
+            valid_mask_coeffs = mask_coeffs[valid_indices]
+
+            # Sort NMS results by confidence and limit
+            sorted_nms = sorted(nms_indices, key=lambda i: valid_scores[i], reverse=True)[:max_detections]
+
+            # 6) Generate results
+            results = []
+            for rank, i in enumerate(sorted_nms):
+                det = {
+                    "class_name": self.class_names[valid_class_ids[i]],
+                    "confidence": float(valid_scores[i]),
+                    "mask": None,
+                    "image_size": {"width": w0, "height": h0}
                 }
-                live_detections.append(detection)
-            
-            return live_detections
-            
+
+                # 7) Generate mask
+                if proto is not None:
+                    try:
+                        # Generate full mask
+                        m = valid_mask_coeffs[i] @ proto.reshape(32, -1)
+                        m = m.reshape(160, 160)
+                        m = 1/(1 + np.exp(-m))  # sigmoid
+                        m = cv2.resize(m, (w0, h0)) > 0.5  # resize to original size
+
+                        # Find contours directly on the full mask
+                        cnts, _ = cv2.findContours((m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if cnts:
+                            # Get the largest contour
+                            largest = max(cnts, key=cv2.contourArea)
+                            det["mask"] = largest.reshape(-1, 2).tolist()
+
+                    except Exception as e:
+                        logger.warning(f"Mask generation failed: {e}")
+
+                results.append(det)
+
+            return results
+
         except Exception as e:
-            logger.error(f"Async fast live detection failed: {e}")
+            logger.error(f"live+mask failed: {e}")
             return []
-    
+
     def _run_inference_optimized(self, input_buffer):
         """Optimized inference with IOBinding for zero-copy"""
         try:
-            # Create OrtValue from numpy array
-            ort_value = ort.OrtValue.ortvalue_from_numpy(input_buffer)
+            inference_start = time.time()
             
-            # Bind input
-            self.io_binding.bind_input(self.input_name, ort_value)
+            # Clear any existing bindings
+            self.io_binding.clear_binding_inputs()
+            self.io_binding.clear_binding_outputs()
+            
+            # Bind input tensor directly from numpy array
+            self.io_binding.bind_cpu_input(
+                self.input_name,
+                input_buffer
+            )
+            
+            # Bind output tensors
+            for output in self.session.get_outputs():
+                self.io_binding.bind_output(output.name)
             
             # Run inference
             self.session.run_with_iobinding(self.io_binding)
             
             # Get outputs
-            outputs = self.io_binding.get_outputs()
-            return [output.numpy() for output in outputs]
+            outputs = [output.numpy() for output in self.io_binding.get_outputs()]
+            
+            inference_time = time.time() - inference_start
+            logger.info(f"⚡ Pure ONNX inference time (optimized): {inference_time:.3f}s")
+            
+            return outputs
             
         except Exception as e:
             logger.error(f"IOBinding inference failed: {e}")
             # Fallback to regular inference
-            return self.session.run(None, {self.input_name: input_buffer})
+            inference_start = time.time()
+            outputs = self.session.run(None, {self.input_name: input_buffer})
+            inference_time = time.time() - inference_start
+            logger.info(f"⚡ Pure ONNX inference time (fallback): {inference_time:.3f}s")
+            return outputs
 
     def fast_live_detect(self, image, conf_threshold: float = 0.2, iou_threshold: float = 0.2, max_detections: int = 50) -> List[dict]:
         """
@@ -227,11 +231,9 @@ class SimpleONNXModel:
         
         Optimizations:
         - GPU acceleration (CUDA/CoreML)
-        - Lower confidence threshold (0.2 default)
-        - Lower IoU threshold (0.2 default)
-        - No mask generation for speed
-        - Limited max detections (50)
-        - Quick NMS for overlap removal
+        - Pre-allocated buffers
+        - Efficient mask generation
+        - Limited max detections
         """
         try:
             # Use the main predict method with fast_mode=True
@@ -239,7 +241,7 @@ class SimpleONNXModel:
                 image,
                 conf_threshold=conf_threshold,
                 iou_threshold=iou_threshold,
-                fast_mode=True  # Enable fast mode for live detection
+                fast_mode=True  # Enable fast mode but still generate masks
             )
             
             # Limit detections for performance
@@ -271,7 +273,7 @@ class SimpleONNXModel:
                 logger.info(f"🖼️ PIL Image input: {img.shape}, min={img.min()}, max={img.max()}")
             elif isinstance(image, np.ndarray):
                 img = image
-                logger.info(f"📷 NumPy array input: {img.shape}, min={img.min()}, max={img.max()}")
+                logger.info(f"�� NumPy array input: {img.shape}, min={img.min()}, max={img.max()}")
             else:
                 raise ValueError(f"Unsupported image type: {type(image)}")
             
@@ -283,60 +285,54 @@ class SimpleONNXModel:
             img_norm = img_resized.astype(np.float32) / 255.0
             img_batch = np.transpose(img_norm, (2, 0, 1))[None, ...]
             
-            # Run inference
+            # Run inference with timing
+            inference_start = time.time()
             outputs = self.session.run(None, {self.input_name: img_batch})
+            inference_time = time.time() - inference_start
+            logger.info(f"⚡ Pure ONNX inference time (predict): {inference_time:.3f}s")
             
             # Extract outputs
-            detections = outputs[0][0].T
-            boxes = detections[:, :4]
-            class_scores = detections[:, 4:84]
+            detections = outputs[0][0].T  # Shape: (8400, 116)
+            boxes = detections[:, :4]  # (8400, 4)
+            class_scores = detections[:, 4:84]  # (8400, 80)
+            mask_coeffs_raw = detections[:, 84:]  # (8400, 32+)
+            mask_protos = outputs[1][0] if len(outputs) > 1 else None  # (32, 160, 160)
             
-            # Extract mask coefficients and prototypes (ALWAYS, even in fast mode)
-            mask_coeffs_raw = detections[:, 84:]  # This might be 8316 coefficients
-            mask_protos = outputs[1][0] if len(outputs) > 1 else None  # Shape: (32, 160, 160)
+            # Calculate confidences and class IDs
+            class_scores_sigmoid = 1 / (1 + np.exp(-class_scores))
+            confidences = np.max(class_scores_sigmoid, axis=1)
+            class_ids = np.argmax(class_scores_sigmoid, axis=1)
             
-            # CRITICAL FIX: Limit mask coefficients to match prototype dimensions
-            if mask_coeffs_raw.shape[1] > 32:
-                logger.info(f"⚠️ Model outputs {mask_coeffs_raw.shape[1]} mask coeffs, limiting to 32")
-                mask_coeffs = mask_coeffs_raw[:, :32]  # Take only first 32 coefficients
-            else:
-                mask_coeffs = mask_coeffs_raw
+            # Log detection stats
+            logger.info(f"🔍 Raw detections: {len(confidences)}, Max confidence: {np.max(confidences):.3f}, Above threshold: {np.sum(confidences > conf_threshold)}")
             
-            # Apply confidence threshold (FIXED: compare sigmoid values, not raw logits)
-            max_scores = np.max(class_scores, axis=1)
-            confidences_sigmoid = 1 / (1 + np.exp(-max_scores))
-            valid_indices = confidences_sigmoid > conf_threshold  # Compare sigmoid, not raw scores!
-            
-            # FAST MODE: Limit detections for live streaming
-            if fast_mode and np.sum(valid_indices) > 10:
-                # Keep only top 10 detections by confidence for speed
-                valid_confidences = confidences_sigmoid[valid_indices]
-                top_indices = np.argsort(valid_confidences)[-10:]  # Top 10
-                temp_indices = np.where(valid_indices)[0]
-                valid_indices = np.zeros_like(valid_indices, dtype=bool)
-                valid_indices[temp_indices[top_indices]] = True
-            
-            logger.info(f"🔍 Raw detections: {len(max_scores)}, Max confidence: {np.max(confidences_sigmoid):.3f}, Above threshold: {np.sum(valid_indices)}")
-            
-            if np.sum(valid_indices) == 0:
-                logger.info("❌ No detections above threshold")
-                return []
-            
+            # Filter by confidence threshold
+            valid_indices = confidences > conf_threshold
             valid_boxes = boxes[valid_indices]
-            valid_scores = class_scores[valid_indices]
-            valid_mask_coeffs = mask_coeffs[valid_indices] if mask_coeffs is not None and mask_protos is not None else None
+            valid_confidences = confidences[valid_indices]
+            valid_class_ids = class_ids[valid_indices]
             
-            # Get class IDs and confidences
-            class_ids = np.argmax(valid_scores, axis=1)
-            confidences = 1 / (1 + np.exp(-np.max(valid_scores, axis=1)))
+            # Log valid detections
+            if np.sum(valid_indices) > 0:
+                logger.info("Valid detections:")
+                for i, (cls_id, conf) in enumerate(zip(valid_class_ids[:5], valid_confidences[:5])):
+                    logger.info(f"  {i}: class={self.class_names.get(cls_id, f'class_{cls_id}')}, score={conf:.3f}")
             
-            # Ultra-fast coordinate conversion and NMS
+            # Handle mask coefficients
+            if mask_coeffs_raw is not None and mask_protos is not None:
+                if mask_coeffs_raw.shape[1] > 32:
+                    mask_coeffs = mask_coeffs_raw[:, :32]  # Take only first 32 coefficients
+                else:
+                    mask_coeffs = mask_coeffs_raw
+                valid_mask_coeffs = mask_coeffs[valid_indices]
+            else:
+                valid_mask_coeffs = None
+            
+            # Convert coordinates and apply NMS
             valid_detections = []
             if len(valid_boxes) > 0:
-                # Vectorized coordinate conversion (much faster)
+                # Convert coordinates
                 x_center, y_center, width, height = valid_boxes.T
-                
-                # Direct scaling without intermediate variables
                 scale_x, scale_y = original_w / 640, original_h / 640
                 
                 x1 = np.clip(((x_center - width / 2) * scale_x).astype(int), 0, original_w)
@@ -344,87 +340,78 @@ class SimpleONNXModel:
                 x2 = np.clip(((x_center + width / 2) * scale_x).astype(int), 0, original_w)
                 y2 = np.clip(((y_center + height / 2) * scale_y).astype(int), 0, original_h)
                 
-                # Apply proper NMS to remove overlapping detections
-                # Convert to x1,y1,x2,y2 format for NMS
-                boxes_for_nms = np.column_stack([x1, y1, x2, y2]).astype(np.float32)
+                # Prepare boxes for NMS
+                boxes_for_nms = np.column_stack([x1, y1, x2, y2])
                 
-                # Use OpenCV NMS with proper IoU threshold
+                # Apply NMS
                 indices = cv2.dnn.NMSBoxes(
                     boxes_for_nms.tolist(),
-                    confidences.tolist(),
-                    conf_threshold,
-                    iou_threshold  # Use the parameter instead of hardcoded value
+                    valid_confidences.tolist(),
+                    score_threshold=0.0001,  # Use very low score threshold since we already filtered
+                    nms_threshold=iou_threshold  # This is where IoU filtering happens
                 )
                 
-                # Get valid indices after NMS
                 if len(indices) > 0:
-                    top_indices = indices.flatten()
-                else:
-                    top_indices = []
-                
-                for idx, i in enumerate(top_indices):
-                    # Double-check confidence threshold after NMS
-                    if confidences[i] > conf_threshold:
-                        # Additional filtering: remove very small boxes
-                        box_width = x2[i] - x1[i]
-                        box_height = y2[i] - y1[i]
-                        box_area = box_width * box_height
-                        
-                        # Skip very small detections (likely noise)
-                        if box_area < 100:  # Minimum 100 pixels area
+                    indices = indices.flatten()
+                    
+                    # Sort by confidence and limit detections
+                    sorted_indices = sorted(indices, key=lambda i: valid_confidences[i], reverse=True)
+                    
+                    # Create detection objects
+                    for i in sorted_indices:
+                        # Skip if we have too many detections of this class
+                        class_name = self.class_names.get(valid_class_ids[i], f"class_{valid_class_ids[i]}")
+                        class_count = sum(1 for d in valid_detections if d["class_name"] == class_name)
+                        if class_count >= 3:  # Limit detections per class
                             continue
-                        # Generate mask if available (NOW WORKS IN FAST MODE TOO!)
-                        mask_points = None
+                            
+                        detection = {
+                            "id": f"det_{i}",
+                            "class_name": class_name,
+                            "confidence": float(valid_confidences[i]),
+                            "bbox": {
+                                "x1": int(x1[i]), "y1": int(y1[i]),
+                                "x2": int(x2[i]), "y2": int(y2[i])
+                            },
+                            "mask": None,
+                            "image_size": {"width": original_w, "height": original_h}
+                        }
+                        
+                        # Generate mask if available
                         if valid_mask_coeffs is not None and mask_protos is not None:
                             try:
-                                # Generate mask from coefficients and prototypes
+                                # Generate mask
                                 mask = np.dot(valid_mask_coeffs[i], mask_protos.reshape(32, -1))
                                 mask = mask.reshape(160, 160)
-                                mask = 1 / (1 + np.exp(-mask))  # Sigmoid activation
+                                mask = 1 / (1 + np.exp(-mask))  # Sigmoid
                                 
                                 # Resize mask to original image size
                                 mask_resized = cv2.resize(mask, (original_w, original_h))
                                 
-                                # Apply mask only within bounding box area for better accuracy
-                                mask_roi = np.zeros_like(mask_resized)
-                                mask_roi[y1[i]:y2[i], x1[i]:x2[i]] = mask_resized[y1[i]:y2[i], x1[i]:x2[i]]
+                                # Get mask for bbox region
+                                mask_roi = mask_resized[y1[i]:y2[i], x1[i]:x2[i]] > 0.5
                                 
-                                # Convert to contour points with better threshold
-                                mask_binary = (mask_roi > 0.5).astype(np.uint8) * 255
-                                contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                if contours:
-                                    # Filter contours by area and select the one closest to bbox center
-                                    bbox_center_x = (x1[i] + x2[i]) // 2
-                                    bbox_center_y = (y1[i] + y2[i]) // 2
+                                if mask_roi.size > 0:
+                                    # Find contours
+                                    cnts, _ = cv2.findContours(
+                                        (mask_roi * 255).astype(np.uint8),
+                                        cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE
+                                    )
                                     
-                                    valid_contours = [c for c in contours if cv2.contourArea(c) > box_area * 0.1]
-                                    if valid_contours:
-                                        # Select contour closest to bbox center
-                                        best_contour = min(valid_contours, key=lambda c: 
-                                            abs(cv2.moments(c)['m10']/cv2.moments(c)['m00'] - bbox_center_x) + 
-                                            abs(cv2.moments(c)['m01']/cv2.moments(c)['m00'] - bbox_center_y)
-                                            if cv2.moments(c)['m00'] > 0 else float('inf'))
-                                        mask_points = best_contour.reshape(-1, 2).tolist()
+                                    if cnts:
+                                        # Get largest contour
+                                        largest = max(cnts, key=cv2.contourArea)
+                                        # Offset points by bbox coordinates
+                                        pts = (largest + [x1[i], y1[i]]).reshape(-1, 2).tolist()
+                                        detection["mask"] = pts
                             except Exception as e:
                                 logger.warning(f"Mask generation failed: {e}")
+                                logger.info(f"Proto shape: {mask_protos.shape}")
+                                logger.info(f"Valid mask coeffs shape: {valid_mask_coeffs[i].shape}")
                         
-                        detection = {
-                            "id": f"det_{idx}",
-                            "class_name": self.class_names.get(class_ids[i], f"class_{class_ids[i]}"),
-                            "confidence": float(confidences[i]),
-                            "bbox": {
-                                "x1": int(x1[i]), "y1": int(y1[i]), 
-                                "x2": int(x2[i]), "y2": int(y2[i])
-                            },
-                            "mask": mask_points,
-                            "image_size": {"width": original_w, "height": original_h}
-                        }
                         valid_detections.append(detection)
             
-            logger.info(f"✅ Returning {len(valid_detections)} detections")
-            if valid_detections:
-                for det in valid_detections:
-                    logger.info(f"   📦 {det['class_name']}: {det['confidence']:.3f}")
             return valid_detections
             
         except Exception as e:
