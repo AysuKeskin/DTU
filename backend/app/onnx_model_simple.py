@@ -69,7 +69,7 @@ class SimpleONNXModel:
         logger.info(f"🎯 Using providers: {self.session.get_providers()}")
         logger.info(f"⚡ Pre-allocated buffers for zero-copy inference")
     
-    async def fast_live_detect_async(self, image, conf_threshold: float = 0.2, iou_threshold: float = 0.4, max_detections: int = 50) -> List[dict]:
+    async def fast_live_detect_async(self, image, conf_threshold: float = 0.6, iou_threshold: float = 0.3, max_detections: int = 50) -> List[dict]:
         """
         ASYNC live detection + segmentation masks
         - GPU + IOBinding + pre-alloc buffers
@@ -91,8 +91,7 @@ class SimpleONNXModel:
             np.copyto(self.input_buffer[0], np.transpose(norm, (2,0,1)))
 
             # 3) GPU inference
-            loop = asyncio.get_event_loop()
-            outputs = await loop.run_in_executor(None, self._run_inference_optimized, self.input_buffer)
+            outputs = self._run_inference_optimized(self.input_buffer)
 
             # 4) Process outputs
             preds = outputs[0][0].T  # (anchors,116)
@@ -105,6 +104,10 @@ class SimpleONNXModel:
             confidences = np.max(class_scores_sigmoid, axis=1)
             class_ids = np.argmax(class_scores_sigmoid, axis=1)
 
+            # Log confidence distribution
+            logger.debug(f"Confidence range: {np.min(confidences):.3f} - {np.max(confidences):.3f}")
+            logger.debug(f"Detections above threshold {conf_threshold}: {np.sum(confidences > conf_threshold)}")
+
             # Filter by confidence
             valid_indices = confidences > conf_threshold
             if not valid_indices.any():
@@ -114,18 +117,18 @@ class SimpleONNXModel:
             valid_scores = confidences[valid_indices]
             valid_class_ids = class_ids[valid_indices]
             valid_boxes = preds[valid_indices, :4]  # Get bounding boxes for NMS
-            
+
             # Convert YOLO format to x1,y1,x2,y2 for NMS
             x_center, y_center, width, height = valid_boxes.T
             scale_x, scale_y = w0 / 640, h0 / 640
-            
+
             x1 = ((x_center - width / 2) * scale_x)
             y1 = ((y_center - height / 2) * scale_y)
             x2 = ((x_center + width / 2) * scale_x)
             y2 = ((y_center + height / 2) * scale_y)
-            
+
             boxes_for_nms = np.column_stack([x1, y1, x2, y2])
-            
+
             # Apply NMS to remove duplicates based on IoU threshold
             nms_indices = cv2.dnn.NMSBoxes(
                 boxes_for_nms.tolist(),
@@ -133,12 +136,12 @@ class SimpleONNXModel:
                 score_threshold=0.0001,  # Very low since we already filtered
                 nms_threshold=iou_threshold
             )
-            
+
             if len(nms_indices) == 0:
                 return []
-            
+
             nms_indices = nms_indices.flatten()
-            
+
             # Limit mask coefficients to match prototype dimensions
             if mask_coeffs_raw.shape[1] > 32:
                 mask_coeffs = mask_coeffs_raw[:, :32]
@@ -153,8 +156,15 @@ class SimpleONNXModel:
             results = []
             for rank, i in enumerate(sorted_nms):
                 det = {
+                    "id": f"det_{rank}",
                     "class_name": self.class_names[valid_class_ids[i]],
                     "confidence": float(valid_scores[i]),
+                    "bbox": {
+                        "x1": int(x1[i]),
+                        "y1": int(y1[i]),
+                        "x2": int(x2[i]),
+                        "y2": int(y2[i])
+                    },
                     "mask": None,
                     "image_size": {"width": w0, "height": h0}
                 }
@@ -171,7 +181,7 @@ class SimpleONNXModel:
                         # Find contours directly on the full mask
                         cnts, _ = cv2.findContours((m * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         if cnts:
-                            # Get the largest contour
+                            # Get largest contour
                             largest = max(cnts, key=cv2.contourArea)
                             det["mask"] = largest.reshape(-1, 2).tolist()
 

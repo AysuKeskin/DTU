@@ -1,25 +1,25 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from typing import List, Optional, Dict
+from pydantic import BaseModel
 import cv2
 import numpy as np
 import base64
-from typing import List, Optional
 import time
-from pydantic import BaseModel
 import logging
 import sys
 import os
-import torch
 import asyncio
 import json
-from threading import Thread
 import queue
-import tempfile
+from threading import Thread
 
-# Import our new video processor
-from .video_processor import VideoProcessor
-from .onnx_model_simple import SimpleONNXModel
+# Import our modules
+from app.onnx_model_simple import SimpleONNXModel
+from app.model_warmup import warmup_model
+from app.model_wrapper import UnifiedModel
+from app.video_processor import VideoProcessor
 from PIL import Image
 import io
 
@@ -107,9 +107,11 @@ class VideoDetectionResponse(BaseModel):
 # =============================================================================
 # GLOBAL VARIABLES & MODEL MANAGEMENT
 # =============================================================================
-# Global model variable
-current_model_name = None
-onnx_model = None
+from typing import Optional, Union
+
+# Global model variables
+model: Optional[Union[SimpleONNXModel, UnifiedModel]] = None
+current_model_name: Optional[str] = None
 
 # =============================================================================
 # STREAMING INFRASTRUCTURE (for real-time camera detection)
@@ -120,7 +122,7 @@ websocket_connections = set()
 streaming_active = False
 
 # =============================================================================
-# DEVICE DETECTION (ONNX Runtime)
+# DEVICE DETECTION
 # =============================================================================
 # Detect best available device for ONNX Runtime
 import onnxruntime as ort
@@ -137,112 +139,69 @@ else:
     device_name = 'CPU'
 
 logger.info(f"Using device: {device} ({device_name})")
-logger.info(f"Available ONNX providers: {providers}")
 
 # Available model options
 AVAILABLE_MODELS = {
-    "yolov8n-seg.onnx": {"name": "YOLOv8n ONNX", "description": "Properly converted ONNX model", "size": "13 MB"}
+    "yolo11n-seg.onnx": {"name": "YOLO11n ONNX", "description": "YOLO11 segmentation model", "size": "11 MB", "type": "onnx"},
+    "yolov8n-seg.onnx": {"name": "YOLOv8n ONNX", "description": "YOLOv8 segmentation model", "size": "13 MB", "type": "onnx"},
+    "yolo11n-seg.pt": {"name": "YOLO11n PyTorch", "description": "YOLO11 segmentation model", "size": "11 MB", "type": "pytorch"},
+    "yolov8n-seg.pt": {"name": "YOLOv8n PyTorch", "description": "YOLOv8 segmentation model", "size": "13 MB", "type": "pytorch"}
 }
 
-def load_onnx_model(model_key: str):
-    """Load a specific ONNX model"""
-    global onnx_model, current_model_name
-    
+# Default model
+default_model = "yolo11n-seg.pt"
+
+def load_model(model_key: str) -> bool:
+    """Load model based on file extension"""
+    global model, current_model_name
+
     if model_key not in AVAILABLE_MODELS:
-        raise ValueError(f"Model {model_key} not available. Available models: {list(AVAILABLE_MODELS.keys())}")
-    
+        raise ValueError(f"{model_key} not in AVAILABLE_MODELS")
+
+    path = os.path.join(os.path.dirname(__file__), '..', model_key)
+    ext = os.path.splitext(model_key)[1].lower()
+
+    logger.info(f"Loading model {model_key} (ext={ext}) on device={device}")
+
     try:
-        logger.info(f"Loading ONNX model: {model_key}")
-        model_path = os.path.join(os.path.dirname(__file__), '..', model_key)
-        onnx_model = SimpleONNXModel(model_path)
+        if ext == ".onnx":
+            model = SimpleONNXModel(path)
+        elif ext in {".pt", ".pth"}:
+            model = UnifiedModel(path)
+        else:
+            raise ValueError(f"Unsupported model type: {ext}")
+
         current_model_name = model_key
-        logger.info(f"✅ ONNX model '{model_key}' loaded successfully on {device}")
+        logger.info(f"✅ Loaded {model_key}")
         return True
     except Exception as e:
-        logger.error(f"❌ Failed to load ONNX model {model_key}: {e}")
+        logger.error(f"❌ Failed to load model {model_key}: {e}")
+        model = None
+        current_model_name = None
         return False
 
-# Load default ONNX model at startup with proper warmup
+# Load default model at startup
 try:
     logger.info("🚀 Starting backend initialization...")
     
-    # Load the ONNX model
-    default_model = "yolov8n-seg.onnx"
-    
-    if load_onnx_model(default_model):
-        logger.info(f"✅ Default ONNX model loaded: {default_model}")
-        
-        # IMPORTANT: Comprehensive model warmup for real-world performance
-        logger.info("🔥 Starting comprehensive ONNX model warmup...")
-        try:
-            import numpy as np
-            from PIL import Image
-            
-            warmup_start = time.time()
-            
-            # Multiple warmup runs with different image sizes and scenarios
-            warmup_configs = [
-                (320, 320, "Small frame"),
-                (640, 640, "Standard frame"), 
-                (1280, 720, "HD frame"),
-                (416, 416, "YOLO optimal")
-            ]
-            
-            logger.info("🔥 Running comprehensive ONNX warmup sequence...")
-            
-            for i, (w, h, desc) in enumerate(warmup_configs):
-                logger.info(f"🔥 Warmup {i+1}/{len(warmup_configs)}: {desc} ({w}x{h})")
-                
-                # Create realistic dummy image (not pure random)
-                dummy_array = np.zeros((h, w, 3), dtype=np.uint8)
-                # Add some realistic patterns
-                dummy_array[:, :, 0] = 100  # Red channel
-                dummy_array[:, :, 1] = 150  # Green channel  
-                dummy_array[:, :, 2] = 200  # Blue channel
-                # Add some noise for realism
-                noise = (np.random.rand(h, w, 3) * 50).astype(np.uint8)
-                dummy_array = np.clip(dummy_array + noise, 0, 255)
-                
-                dummy_image = Image.fromarray(dummy_array)
-                
-                # Run multiple inferences for thorough optimization
-                for j in range(5):  # 5 runs per size for complete optimization
-                    inference_start = time.time()
-                    detections = onnx_model.predict(dummy_image, conf_threshold=0.25)
-                    inference_time = time.time() - inference_start
-                    
-                    if j == 0:
-                        logger.info(f"   • First inference: {inference_time:.3f}s")
-                    elif j == 4:
-                        logger.info(f"   • Final inference: {inference_time:.3f}s (optimized)")
-            
-            warmup_time = time.time() - warmup_start
-            
-            # Final performance test with realistic scenario
-            logger.info("🎯 Final performance validation...")
-            test_array = np.random.randint(0, 255, (640, 640, 3), dtype=np.uint8)
-            test_image = Image.fromarray(test_array)
-            
-            # Test multiple confidence levels
-            for conf in [0.25, 0.5, 0.7]:
-                test_start = time.time()
-                detections = onnx_model.predict(test_image, conf_threshold=conf)
-                test_time = time.time() - test_start
-                logger.info(f"   • Confidence {conf}: {test_time:.3f}s")
-            
-            logger.info(f"🔥 Comprehensive ONNX warmup completed in {warmup_time:.2f}s")
-            logger.info(f"✅ ONNX model is fully optimized and ready for production use!")
-        except Exception as warmup_error:
-            logger.warning(f"⚠️ ONNX model warmup failed: {warmup_error}, but model is loaded")
-        
+    if load_model(default_model):
+        logger.info(f"✅ Default model loaded: {default_model}")
+        warmup_model(model, default_model)
     else:
-        raise Exception("Failed to load ONNX model")
+        # Try PyTorch model as fallback
+        default_model = "yolo11n-seg.pt"
+        if load_model(default_model):
+            logger.info(f"✅ Fallback model loaded: {default_model}")
+            warmup_model(model, default_model)
+        else:
+            raise Exception("Failed to load any model")
     
     logger.info("✅ Backend initialization complete - ready to accept requests!")
         
 except Exception as e:
     logger.error(f"❌ Failed to initialize backend: {e}")
-    onnx_model = None
+    model = None
+    current_model_name = None
 
 
 # =============================================================================
@@ -252,8 +211,8 @@ except Exception as e:
 @app.post("/detect", response_model=DetectionResponse)
 async def detect_fish(
     file: UploadFile = File(...),
-    confidence: float = 0.6,
-    iou_threshold: float = 0.7
+    confidence: float = Form(default=0.6),
+    iou_threshold: float = Form(default=0.3)
 ):
     """
     MAIN IMAGE DETECTION ENDPOINT
@@ -270,11 +229,11 @@ async def detect_fish(
         logger.info(f"🚀 Starting detection for: {file.filename} with confidence={confidence}, IoU={iou_threshold}")
         
         # Check if model is loaded
-        if onnx_model is None:
-            logger.error("❌ ONNX model not loaded!")
-            raise HTTPException(status_code=500, detail="ONNX model not loaded")
+        if model is None:
+            logger.error("❌ No model loaded!")
+            raise HTTPException(status_code=500, detail="No model loaded")
         
-        logger.info(f"✅ ONNX model loaded: {current_model_name} on {device}")
+        logger.info(f"✅ Model loaded: {current_model_name} on {device}")
         
         # Step 1: Read and decode file
         step_start = time.time()
@@ -290,22 +249,25 @@ async def detect_fish(
         if original_width > 2000 or original_height > 2000:
             logger.warning(f"⚠️ Large image detected: {original_width}x{original_height} - this may be slow")
         
-        # Step 2: ONNX inference with timeout protection
+        # Step 2: Model inference with timeout protection
         step_start = time.time()
-        logger.info(f"🤖 Starting ONNX inference with confidence={confidence}")
+        logger.info(f"🤖 Starting inference with confidence={confidence}")
         try:
-            # Run ONNX inference
-            detections = onnx_model.predict(image, conf_threshold=confidence, iou_threshold=iou_threshold)
-            step_times['onnx_inference'] = time.time() - step_start
-            logger.info(f"🤖 ONNX inference completed: {step_times['onnx_inference']:.3f}s")
+            # Run model inference
+            loop = asyncio.get_event_loop()
+            detections = await loop.run_in_executor(None,
+                lambda: model.predict(image, conf_threshold=confidence, iou_threshold=iou_threshold)
+            )
+            step_times['inference'] = time.time() - step_start
+            logger.info(f"🤖 Inference completed: {step_times['inference']:.3f}s")
             
             # Check if inference took too long
-            if step_times['onnx_inference'] > 5.0:
-                logger.warning(f"⚠️ Slow ONNX inference: {step_times['onnx_inference']:.3f}s")
+            if step_times['inference'] > 5.0:
+                logger.warning(f"⚠️ Slow inference: {step_times['inference']:.3f}s")
                 
         except Exception as e:
             inference_time = time.time() - step_start
-            logger.error(f"❌ ONNX inference failed after {inference_time:.3f}s: {e}")
+            logger.error(f"❌ Inference failed after {inference_time:.3f}s: {e}")
             # Return empty response instead of crashing
             return DetectionResponse(
                 detections=[],
@@ -314,11 +276,11 @@ async def detect_fish(
                 model_version=f"Error: {str(e)}"
             )
         
-        # Step 3: Process ONNX results
+        # Step 3: Process results
         step_start = time.time()
         
-        # ONNX model already returns detections in the correct format
-        logger.info(f"📊 Found {len(detections)} detections from ONNX model")
+        # Model returns detections in the correct format
+        logger.info(f"📊 Found {len(detections)} detections")
         
         # Convert to Detection objects
         detection_objects = []
@@ -349,9 +311,13 @@ async def detect_fish(
         # Draw boxes
         for detection in detection_objects:
             bbox = detection.bbox
-            cv2.rectangle(img_bgr, (bbox["x1"], bbox["y1"]), (bbox["x2"], bbox["y2"]), (0, 255, 0), 2)
+            # Convert float coordinates to integers for OpenCV
+            x1, y1 = int(bbox["x1"]), int(bbox["y1"])
+            x2, y2 = int(bbox["x2"]), int(bbox["y2"])
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
             label = f"{detection.class_name}: {detection.confidence:.2f}"
-            cv2.putText(img_bgr, label, (bbox["x1"], bbox["y1"]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Use the same integer coordinates for text
+            cv2.putText(img_bgr, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         # Encode to base64
         _, buffer = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -363,7 +329,15 @@ async def detect_fish(
         model_info = f"{AVAILABLE_MODELS.get(current_model_name, {}).get('name', current_model_name)} on {device}"
         
         # Summary timing log
-        logger.info(f"⚡ TOTAL: {processing_time:.3f}s | File: {step_times['file_processing']:.3f}s | ONNX: {step_times['onnx_inference']:.3f}s | Processing: {step_times['result_processing']:.3f}s | Encoding: {step_times['image_encoding']:.3f}s | Objects: {len(detection_objects)}")
+        logger.info(
+            f"⚡ TOTAL: {processing_time:.3f}s | "
+            f"File: {step_times['file_processing']:.3f}s | "
+            f"Inference: {step_times['inference']:.3f}s | "
+            f"Processing: {step_times['result_processing']:.3f}s | "
+            f"Encoding: {step_times['image_encoding']:.3f}s | "
+            f"Objects: {len(detection_objects)}"
+        )
+
         
         return DetectionResponse(
             detections=detection_objects,
@@ -466,57 +440,58 @@ async def change_model(model_key: str):
     """
     MODEL CHANGE ENDPOINT
     ====================
-    Changes the active ONNX model for:
-    - Switching between different ONNX models
+    Changes the active model for:
+    - Switching between ONNX and PyTorch models
     - Model performance optimization
     - Different detection capabilities
     """
     try:
-        logger.info(f"🔄 ONNX model change requested: {model_key}")
+        logger.info(f"🔄 Model change requested: {model_key}")
         
         if model_key == current_model_name:
-            logger.info(f"✅ ONNX model {model_key} already loaded")
             return {
                 "success": True,
-                "message": f"ONNX model {model_key} already active",
+                "message": f"Model {model_key} already active",
                 "current_model": current_model_name,
                 "model_info": AVAILABLE_MODELS[model_key],
                 "loading_time": 0.0
             }
         
         start_time = time.time()
-        if load_onnx_model(model_key):
+        if load_model(model_key):
+            # Warmup both kinds of models the same way
+            warmup_model(model, model_key)
             loading_time = time.time() - start_time
-            logger.info(f"✅ ONNX model change completed in {loading_time:.2f}s")
+            logger.info(f"✅ Model change completed in {loading_time:.2f}s")
             return {
                 "success": True,
-                "message": f"ONNX model changed to {model_key}",
+                "message": f"Model changed to {model_key}",
                 "current_model": current_model_name,
                 "model_info": AVAILABLE_MODELS[model_key],
                 "loading_time": loading_time
             }
         else:
-            raise HTTPException(status_code=500, detail=f"Failed to load ONNX model {model_key}")
+            raise HTTPException(status_code=500, detail=f"Failed to load model {model_key}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error changing ONNX model: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error changing model: {str(e)}")
 
 @app.get("/model-status")
 async def get_model_status():
     """
     MODEL STATUS ENDPOINT
     ====================
-    Returns current ONNX model loading status for:
+    Returns current model loading status for:
     - Frontend status indicators
     - Model readiness checks
     """
     return {
-        "model_loaded": onnx_model is not None,
+        "model_loaded": model is not None,
         "current_model": current_model_name,
         "device": device,
         "device_name": device_name,
-        "ready_for_detection": onnx_model is not None,
+        "ready_for_detection": model is not None,
         "model_info": AVAILABLE_MODELS.get(current_model_name, {}) if current_model_name else {}
     }
 
@@ -530,7 +505,7 @@ async def health_check():
     - Model inference capability testing
     - Frontend connection status
     """
-    model_ready = onnx_model is not None
+    model_ready = model is not None
     
     # Test if model can actually run inference
     inference_ready = False
@@ -542,7 +517,7 @@ async def health_check():
             from PIL import Image
             test_array = (np.random.rand(64, 64, 3) * 255).astype(np.uint8)
             test_image = Image.fromarray(test_array)
-            _ = onnx_model.predict(test_image, conf_threshold=0.25)
+            _ = model.predict(test_image, conf_threshold=0.25)
             test_time = time.time() - test_start
             inference_ready = True
             inference_test_time = test_time
@@ -605,7 +580,7 @@ async def video_stream():
 async def websocket_endpoint(websocket: WebSocket):
     """
     WEBSOCKET ENDPOINT FOR REAL-TIME DETECTION
-    ==========================================
+    ========================================
     Handles real-time detection via WebSocket for:
     - Live Camera Mode: Real-time object detection
     - Receives frames from frontend camera
@@ -617,7 +592,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # Parse query parameters from WebSocket URL
     query_params = websocket.query_params
     confidence = float(query_params.get('confidence', 0.6))
-    iou_threshold = float(query_params.get('iou_threshold', 0.7))
+    iou_threshold = float(query_params.get('iou_threshold', 0.3))
     
     logger.info(f"🔌 WebSocket connected for real-time detection with confidence: {confidence}, IoU: {iou_threshold}")
     
@@ -631,88 +606,79 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             # Receive frame data from frontend
             data = await websocket.receive_bytes()
-            # Removed frame logging for maximum speed
             
             try:
-                # Decode the frame
+                # Decode frame
                 nparr = np.frombuffer(data, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
                 if frame is not None:
-                    # Convert frame for ONNX (BGR → RGB conversion handled in model)
-                    # Note: frame is in BGR format from OpenCV, model will convert it properly
-                    
-                    # Run FAST live detection optimized for streaming (non-blocking)
-                    # Use the async method directly
-                    # Convert to RGB exactly as in your image endpoint
+                    # Convert BGR to RGB for model
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    detections = await onnx_model.fast_live_detect_async(
-                        rgb_frame, 
-                        conf_threshold=confidence,
-                        iou_threshold=iou_threshold,
-                        max_detections=5  # Limit max detections to prevent duplicates
-                    )
+                    
+                    # Check if model is loaded
+                    if model is None:
+                        logger.error("❌ No model loaded!")
+                        raise HTTPException(status_code=500, detail="No model loaded")
 
+                    # Use fast_live_detect_async if available, otherwise regular predict
+                    logger.debug(f"Running detection on frame {websocket_endpoint.frame_count}")
+                    try:
+                        detections = await model.fast_live_detect_async(
+                            rgb_frame,
+                            conf_threshold=confidence,
+                            iou_threshold=iou_threshold,
+                            max_detections=5  # Limit detections for speed
+                        )
+                    except AttributeError:
+                        # Fallback to regular predict if fast_live_detect_async not available
+                        detections = model.predict(
+                            rgb_frame,
+                            conf_threshold=confidence,
+                            iou_threshold=iou_threshold,
+                            fast_mode=True
+                        )
                     
-                    # PERFORMANCE OPTIMIZATION: Reduced logging frequency
-                    # Only log every 30 frames to avoid performance impact
-                    frame_count = getattr(websocket_endpoint, 'frame_count', 0) + 1
-                    websocket_endpoint.frame_count = frame_count
+                    # Log detection results
+                    if detections:
+                        logger.info(f"Found {len(detections)} detections in frame {websocket_endpoint.frame_count}")
+                        for det in detections[:3]:  # Log first 3 detections
+                            logger.info(f"  {det['class_name']}: {det['confidence']:.2f}")
                     
-                    if len(detections) > 0 and frame_count % 30 == 0:
-                        logger.info(f"📦 Processing frame {frame_count}: {len(detections)} detections")
+                    # Update performance counters
+                    websocket_endpoint.frame_count += 1
                     
-                    # Convert detections to streaming format (masks only)
-                    streaming_detections = []
-                    for detection in detections:
-                        # Only include necessary data for mask drawing
-                        streaming_detection = {
-                            "class_name": detection["class_name"],
-                            "confidence": detection["confidence"],
-                            "mask": detection["mask"],
-                            "image_size": {"width": frame.shape[1], "height": frame.shape[0]}
-                        }
-                        streaming_detections.append(streaming_detection)
+                    # Send results
+                    await websocket.send_json({
+                        "detections": detections,
+                        "frame_count": websocket_endpoint.frame_count,
+                        "timestamp": time.time()
+                    })
                     
-                    # Debug: Log mask information
-                    mask_count = sum(1 for det in streaming_detections if det["mask"] is not None)
-                    if len(streaming_detections) > 0:
-                        logger.info(f"🎭 WebSocket sending {len(streaming_detections)} detections, {mask_count} with masks")
-                        for i, det in enumerate(streaming_detections[:3]):  # Log first 3
-                            mask_info = f"mask: {len(det['mask'])} points" if det['mask'] else "no mask"
-                            logger.info(f"  Detection {i}: {det['class_name']} ({det['confidence']:.2f}) - {mask_info}")
-                    
-                    # Send detection results back immediately
-                    response_data = {
-                        "detections": streaming_detections,
-                        "timestamp": time.time(),
-                        "status": "success"
-                    }
-                    
-                    await websocket.send_text(json.dumps(response_data))
-                    
-                    # PERFORMANCE MONITORING: Log FPS every 5 seconds
-                    current_time = time.time()
-                    if current_time - websocket_endpoint.last_fps_log >= 5.0:
-                        elapsed_time = current_time - websocket_endpoint.start_time
-                        fps = websocket_endpoint.frame_count / elapsed_time if elapsed_time > 0 else 0
-                        logger.info(f"🚀 WebSocket Performance: {fps:.1f} FPS, {websocket_endpoint.frame_count} frames processed")
-                        websocket_endpoint.last_fps_log = current_time
+                    # Log FPS every 30 frames
+                    if websocket_endpoint.frame_count % 30 == 0:
+                        current_time = time.time()
+                        elapsed = current_time - websocket_endpoint.start_time
+                        fps = websocket_endpoint.frame_count / elapsed if elapsed > 0 else 0
+                        logger.info(f"🚀 Processing at {fps:.1f} FPS")
                 
             except Exception as e:
-                logger.error(f"Detection processing error: {e}")
-                # Send error response
-                error_response = {
-                    "detections": [],
-                    "error": str(e),
-                    "status": "error"
-                }
-                await websocket.send_text(json.dumps(error_response))
+                websocket_endpoint.error_count += 1
+                logger.error(f"Frame processing error: {e}")
+                if websocket_endpoint.error_count > 10:
+                    logger.error("Too many errors, closing connection")
+                    break
+                continue
     
+    except WebSocketDisconnect:
+        logger.info("🔌 WebSocket client disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        logger.info("🔌 WebSocket disconnected")
+        # Log final statistics
+        elapsed = time.time() - websocket_endpoint.start_time
+        fps = websocket_endpoint.frame_count / elapsed if elapsed > 0 else 0
+        logger.info(f"WebSocket closed. Processed {websocket_endpoint.frame_count} frames at {fps:.1f} FPS")
 
 @app.post("/start-stream")
 async def start_stream():
@@ -726,12 +692,11 @@ async def start_stream():
     logger.info("🚀 Starting video stream...")
     
     try:
-        # Start the detection thread
-        detection_thread = Thread(target=detection_worker, daemon=True)
-        detection_thread.start()
+        # Start the detection task in the background
+        asyncio.create_task(detection_worker())
         
         # Give it a moment to initialize
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
         
         logger.info("✅ Streaming started successfully")
         return {
@@ -819,43 +784,15 @@ async def force_detect():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_frame)
         
-        # Run YOLO inference
-        results = yolo_model(pil_image, conf=0.3, verbose=False)
+        # Run model inference
+        detections = model.predict(pil_image, conf_threshold=0.3, iou_threshold=0.3)
         
-        # Process detections
-        detections = []
-        if results and len(results) > 0:
-            r = results[0]
-            if r.boxes is not None:
-                logger.info(f"📦 Found {len(r.boxes)} detections")
-                for i, (box, conf, cls) in enumerate(zip(r.boxes.xyxy, r.boxes.conf, r.boxes.cls)):
-                    x1, y1, x2, y2 = map(int, box.tolist())
-                    class_name = yolo_model.names[int(cls)]
+        # Log detections
+        if detections:
+            logger.info(f"📦 Found {len(detections)} detections")
                     
-                    detection = {
-                        "id": f"det_{i}",
-                        "class_name": class_name,
-                        "confidence": float(conf),
-                        "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                        "mask": None,  # Simplified for testing
-                        "image_size": {"width": frame.shape[1], "height": frame.shape[0]}
-                    }
-                    
-                    # Extract mask if available
-                    if r.masks is not None and len(r.masks.data) > i:
-                        try:
-                            mask = r.masks.data[i].cpu().numpy()
-                            mask_resized = cv2.resize(mask, (frame.shape[1], frame.shape[0]))
-                            contours, _ = cv2.findContours((mask_resized * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            if contours:
-                                largest_contour = max(contours, key=cv2.contourArea)
-                                mask_points = largest_contour.reshape(-1, 2).tolist()
-                                detection["mask"] = mask_points
-                                logger.info(f"✅ Extracted mask with {len(mask_points)} points")
-                        except Exception as e:
-                            logger.warning(f"Mask extraction failed: {e}")
-                    
-                    detections.append(detection)
+                            # Detections already contain everything we need
+        # Just log the results and return
         
         # Update detection results
         detection_results = {
@@ -894,7 +831,7 @@ async def video_websocket_endpoint(websocket: WebSocket):
     
     # Parse query parameters from WebSocket URL
     query_params = websocket.query_params
-    confidence = float(query_params.get('confidence', 0.3))
+    confidence = float(query_params.get('confidence', 0.6))
     iou_threshold = float(query_params.get('iou_threshold', 0.2))
     
     logger.info(f"🎬 Video WebSocket connected with confidence: {confidence}, IoU: {iou_threshold}")
@@ -920,13 +857,27 @@ async def video_websocket_endpoint(websocket: WebSocket):
                     
                     # Run FAST live detection for video streaming (non-blocking)
                     # Use the async method directly
+                    # Check if model is loaded
+                    if model is None:
+                        logger.error("❌ No model loaded!")
+                        raise HTTPException(status_code=500, detail="No model loaded")
+
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    detections = await onnx_model.fast_live_detect_async(
-                        rgb_frame, 
-                        conf_threshold=confidence, 
-                        iou_threshold=iou_threshold, 
-                        max_detections=50
-                    )
+                    try:
+                        detections = await model.fast_live_detect_async(
+                            rgb_frame,
+                            conf_threshold=confidence,
+                            iou_threshold=iou_threshold,
+                            max_detections=50
+                        )
+                    except AttributeError:
+                        # Fallback to regular predict if fast_live_detect_async not available
+                        detections = model.predict(
+                            rgb_frame,
+                            conf_threshold=confidence,
+                            iou_threshold=iou_threshold,
+                            fast_mode=True
+                        )
                     
                             # Log detection count every 30 frames
                     if frame_count % 30 == 0:
@@ -1000,13 +951,13 @@ async def detect_video(
         logger.info(f"🎬 Starting optimized video detection for: {file.filename}")
         
         # Check if model is loaded
-        if onnx_model is None:
-            logger.error("❌ ONNX model not loaded!")
-            raise HTTPException(status_code=500, detail="ONNX model not loaded")
+        if model is None:
+            logger.error("❌ No model loaded!")
+            raise HTTPException(status_code=500, detail="No model loaded")
         
         # Initialize video processor
         video_processor = VideoProcessor(
-            onnx_model=onnx_model,
+            model=model,
             confidence_threshold=confidence,
             motion_threshold=motion_threshold,
             min_motion_area=min_motion_area,
@@ -1090,8 +1041,8 @@ async def detect_video(
         logger.error(f"❌ Video detection failed: {e}")
         raise HTTPException(status_code=500, detail=f"Video processing failed: {str(e)}")
 
-def detection_worker():
-    """Background worker that processes frames and runs YOLO detection"""
+async def detection_worker():
+    """Background worker that processes frames and runs model detection"""
     global detection_results
     
     logger.info("🎥 Starting detection worker...")
@@ -1113,19 +1064,32 @@ def detection_worker():
                     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                     
                     if frame is not None:
-                        # Run ONNX detection on every frame for smooth live detection
-                        should_detect = (onnx_model is not None and 
+                        # Run detection on every frame for smooth live detection
+                        should_detect = (model is not None and 
                                        current_time - last_detection_time > 0.05)  # Max 20 FPS detection
                         
                         if should_detect:
                             try:
                                 last_detection_time = current_time
                                 
-                                # Convert frame for ONNX (optimized)
+                                # Convert frame for model
                                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                 
-                                # Run ULTRA-FAST live detection for background worker
-                                detections = onnx_model.fast_live_detect(rgb_frame, conf_threshold=0.25, max_detections=50)
+                                # Try fast live detection first, fallback to regular predict
+                                try:
+                                    detections = await model.fast_live_detect_async(
+                                        rgb_frame,
+                                        conf_threshold=0.25,
+                                        iou_threshold=0.3,
+                                        max_detections=50
+                                    )
+                                except AttributeError:
+                                    detections = model.predict(
+                                        rgb_frame,
+                                        conf_threshold=0.25,
+                                        iou_threshold=0.3,
+                                        fast_mode=True
+                                    )
                                 
                                 # Update detection results for WebSocket
                                 detection_results = {
