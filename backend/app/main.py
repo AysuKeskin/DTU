@@ -636,7 +636,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             rgb_frame,
                             conf_threshold=confidence,
                             iou_threshold=iou_threshold,
-                            fast_mode=True
+                        
                         )
                     
                     # Log detection results

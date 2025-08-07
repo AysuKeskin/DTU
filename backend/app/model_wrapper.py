@@ -1,225 +1,305 @@
-import asyncio
-import cv2
+import logging
+import time
+from typing import List, Dict, Union, Optional
 import numpy as np
+import cv2
 from PIL import Image
 import torch
 from ultralytics import YOLO
-from .onnx_model_simple import SimpleONNXModel
-from typing import Union
-import time
-import logging
+import onnxruntime as ort
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app.main")
 
 class UnifiedModel:
-    """Ultra-optimized unified model wrapper for high-speed streaming"""
+    """Unified wrapper for both ONNX and PyTorch YOLO models"""
     
-    def __init__(self, model_path: str, device: str = None):
+    def __init__(self, model_path: str):
+        """Initialize model wrapper
+        
+        Args:
+            model_path: Path to either .pt or .onnx model file
+        """
         self.model_path = model_path
-        self.is_onnx = model_path.endswith('.onnx')
+        self.model_type = 'pt' if model_path.endswith('.pt') else 'onnx'
+        logger.info(f"Loading {self.model_type.upper()} model from {model_path}")
         
-        # Device selection with optimization
-        if device:
-            self.device = device
-        else:
-            if torch.cuda.is_available():
-                self.device = 'cuda'
-                # CRITICAL GPU optimizations
-                torch.backends.cudnn.benchmark = True
-                torch.backends.cudnn.deterministic = False
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                logger.info("🚀 GPU optimizations enabled")
-            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                self.device = 'mps'
-            else:
-                self.device = 'cpu'
-        
-        # Load and optimize model
-        if self.is_onnx:
-            self.model = SimpleONNXModel(model_path)
-            logger.info("✅ ONNX model loaded")
-        else:
-            self._load_and_optimize_pytorch_model()
-        
-        # Pre-allocate buffers for image processing
-        self._setup_buffers()
-        
-    
-    def _load_and_optimize_pytorch_model(self):
-        """Load and heavily optimize PyTorch YOLO model"""
-        logger.info("📥 Loading PyTorch YOLO model...")
-        
-        # Load model
-        self.model = YOLO(self.model_path)
-        
-        # Critical optimizations
-        self.model.fuse()  # Fuse Conv2d + BatchNorm
-        
-        if self.device == 'cuda':
-            # Move to GPU with half precision
-            self.model.model.half().to(self.device)
-            logger.info("⚡ Using FP16 precision on GPU")
-        else:
-            self.model.model.to(self.device)
-        
-        # Set to eval mode for inference
-        self.model.model.eval()
-        
-        # Disable gradient computation permanently
-        for param in self.model.model.parameters():
-            param.requires_grad_(False)
-        
-        # Enable optimized memory format if available
-        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            torch.backends.cuda.enable_flash_sdp(True)
-        
-        logger.info("✅ PyTorch model optimized")
-    
-    def _setup_buffers(self):
-        """Pre-allocate buffers for zero-copy image processing"""
-        self.max_size = 1920 * 1080 * 3  # Max buffer size
-        self.temp_buffer = np.empty(self.max_size, dtype=np.uint8)
-        
-   
-    
-    def _fast_image_prep(self, image: Union[Image.Image, np.ndarray, bytes]) -> np.ndarray:
-        """Ultra-fast image preprocessing with minimal copies"""
-        if isinstance(image, (bytes, bytearray)):
-            # Decode directly to RGB
-            arr = np.frombuffer(image, np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, dst=img)  # In-place conversion
-            return img
-        elif isinstance(image, Image.Image):
-            # Convert PIL to numpy (unavoidable copy)
-            return np.array(image)
-        else:
-            # Assume it's already a numpy array - no copy needed
-            return image
-    
-    def predict(
-        self,
-        image: Union[Image.Image, np.ndarray, bytes],
-        conf_threshold: float = 0.6,
-        iou_threshold: float = 0.3,
-        fast_mode: bool = True  # Default to fast mode for streaming
-    ) -> list:
-        """Optimized single-image inference"""
-        
-        # Fast image preparation
-        img = self._fast_image_prep(image)
-        
-        if self.is_onnx:
-            return self.model.predict(img, conf_threshold, iou_threshold)
-        
-        # PyTorch inference with optimizations
-        inference_start = time.time()
-        
-        with torch.no_grad():
-            # Optimized predict call
-            results = self.model.predict(
-                source=img,
-                conf=conf_threshold,
-                iou=iou_threshold,
-                device=self.device,
-                verbose=False,
-                save=False,
-                show=False,
-                stream=False,  # Don't use generator for single images
-                # Additional speed optimizations
-                augment=False,  # Disable test-time augmentation
-                visualize=False,
-                embed=None,
-                half=self.device == 'cuda'  # Use FP16 if on GPU
-            )
-        
-        inference_time = time.time() - inference_start
-        
-        # Fast result conversion
-        detections = []
-        if results and len(results) > 0:
-            r = results[0]  # Single image result
-            if r.boxes is not None and len(r.boxes) > 0:
-                # Vectorized conversion for speed
-                boxes_xyxy = r.boxes.xyxy.cpu().numpy()
-                confidences = r.boxes.conf.cpu().numpy()
-                class_ids = r.boxes.cls.cpu().numpy().astype(int)
-                
-                for i, (box, conf, cls_id) in enumerate(zip(boxes_xyxy, confidences, class_ids)):
-                    x1, y1, x2, y2 = box
-                    detections.append({
-                        'id': f'det_{i}',
-                        'class_name': r.names[cls_id],
-                        'confidence': float(conf),
-                        'bbox': {
-                            'x1': int(x1), 'y1': int(y1), 
-                            'x2': int(x2), 'y2': int(y2)
-                        }
-                    })
-        
-        logger.debug(f"⚡ PyTorch inference: {inference_time*1000:.1f}ms, detections: {len(detections)}")
-        return detections
-    
-    def fast_live_detect(self, frame: np.ndarray,
-                        conf_threshold: float = 0.5,
-                        iou_threshold: float = 0.45,
-                        max_detections: int = 50) -> list:
-        """Synchronous fast detection for live streaming"""
-        detections = self.predict(frame, conf_threshold, iou_threshold, fast_mode=True)
-        return detections[:max_detections]
-    
-    async def fast_live_detect_async(self, frame: np.ndarray,
-                                   conf_threshold: float = 0.5,
-                                   iou_threshold: float = 0.45,
-                                   max_detections: int = 50) -> list:
-        """Truly async inference using asyncio"""
-        # For streaming, synchronous is often faster than thread pool overhead
-        # Only use async if you have other async operations
-        return self.fast_live_detect(frame, conf_threshold, iou_threshold, max_detections)
-    
-    def get_model_info(self):
-        """Get model performance information"""
-        return {
-            'backend': 'ONNX' if self.is_onnx else 'PyTorch',
-            'device': self.device,
-            'optimizations': {
-                'fused': not self.is_onnx,
-                'half_precision': self.device == 'cuda' and not self.is_onnx,
-                'cudnn_benchmark': torch.backends.cudnn.benchmark if not self.is_onnx else False
-            }
+        # COCO class names (hardcoded for performance)
+        self.class_names = {
+            0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane", 5: "bus",
+            6: "train", 7: "truck", 8: "boat", 9: "traffic light", 10: "fire hydrant",
+            11: "stop sign", 12: "parking meter", 13: "bench", 14: "bird", 15: "cat",
+            16: "dog", 17: "horse", 18: "sheep", 19: "cow", 20: "elephant",
+            21: "bear", 22: "zebra", 23: "giraffe", 24: "backpack", 25: "umbrella",
+            26: "handbag", 27: "tie", 28: "suitcase", 29: "frisbee", 30: "skis",
+            31: "snowboard", 32: "sports ball", 33: "kite", 34: "baseball bat", 35: "baseball glove",
+            36: "skateboard", 37: "surfboard", 38: "tennis racket", 39: "bottle", 40: "wine glass",
+            41: "cup", 42: "fork", 43: "knife", 44: "spoon", 45: "bowl",
+            46: "banana", 47: "apple", 48: "sandwich", 49: "orange", 50: "broccoli",
+            51: "carrot", 52: "hot dog", 53: "pizza", 54: "donut", 55: "cake",
+            56: "chair", 57: "couch", 58: "potted plant", 59: "bed", 60: "dining table",
+            61: "toilet", 62: "tv", 63: "laptop", 64: "mouse", 65: "remote",
+            66: "keyboard", 67: "cell phone", 68: "microwave", 69: "oven", 70: "toaster",
+            71: "sink", 72: "refrigerator", 73: "book", 74: "clock", 75: "vase",
+            76: "scissors", 77: "teddy bear", 78: "hair drier", 79: "toothbrush"
         }
-
-# Usage example for WebSocket streaming:
-class StreamingOptimizer:
-    """Additional optimizations for WebSocket streaming"""
+        
+        if self.model_type == 'pt':
+            # Load PyTorch model
+            self.model = YOLO(model_path)
+            logger.info("✅ PyTorch model loaded successfully")
+            
+        else:
+            # Load ONNX model
+            session_options = ort.SessionOptions()
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            
+            # Check available providers
+            available_providers = ort.get_available_providers()
+            logger.info(f"Available ONNX providers: {available_providers}")
+            
+            if 'CUDAExecutionProvider' in available_providers:
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                logger.info("🚀 Using CUDA GPU acceleration for ONNX inference")
+            elif 'CoreMLExecutionProvider' in available_providers:
+                providers = ['CoreMLExecutionProvider', 'CPUExecutionProvider']
+                logger.info("🚀 Using Apple Silicon GPU acceleration for ONNX inference")
+            else:
+                providers = ['CPUExecutionProvider']
+                logger.info("⚠️ Using CPU only - no GPU acceleration available")
+            
+            try:
+                self.model = ort.InferenceSession(model_path, session_options, providers=providers)
+                
+                # Get input details
+                inp = self.model.get_inputs()[0]
+                self.input_name = inp.name
+                
+                # Handle dynamic dimensions
+                def get_dim(d):
+                    if isinstance(d, (int, float)):
+                        return int(d)
+                    if isinstance(d, str):
+                        if d.lower() in ['batch', 'n']:
+                            return 1
+                        if d.isdigit():
+                            return int(d)
+                        return 640  # Default size for dynamic H,W dimensions
+                    return 640  # Default fallback
+                
+                # Convert shape dimensions safely
+                raw_shape = inp.shape
+                self.input_shape = tuple(get_dim(d) for d in raw_shape)
+                logger.info(f"Model input shape: {raw_shape} -> {self.input_shape}")
+                
+                # Pre-allocate buffers
+                self.input_buffer = np.empty(self.input_shape, dtype=np.float32)
+                self.max_detections = 50
+                self.coord_buffer = np.empty((self.max_detections, 4), dtype=np.float32)
+                
+                # Get mask dimensions if available
+                outputs = self.model.get_outputs()
+                if len(outputs) > 1:
+                    nm = get_dim(outputs[1].shape[1])
+                    self.mask_coeff_buffer = np.empty((self.max_detections, nm), dtype=np.float32)
+                    logger.info(f"Mask prototypes: {nm}")
+                else:
+                    self.mask_coeff_buffer = None
+                
+                # Set up IO binding
+                self.io_binding = self.model.io_binding()
+                logger.info("✅ ONNX model loaded successfully")
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to load ONNX model: {str(e)}")
+                raise
     
-    def __init__(self, model: UnifiedModel):
-        self.model = model
-        self.frame_skip = 0  # Skip frames if processing is slow
-        self.last_process_time = 0
+    def predict(self, image: Union[np.ndarray, Image.Image], conf_threshold: float = 0.6, 
+               iou_threshold: float = 0.3, max_detections: int = 50) -> List[Dict]:
+        """Run inference on an image
         
-    def should_process_frame(self, target_fps: int = 30) -> bool:
-        """Adaptive frame skipping for consistent FPS"""
-        target_interval = 1.0 / target_fps
-        current_time = time.time()
-        
-        if current_time - self.last_process_time < target_interval:
-            return False
-        
-        return True
+        Args:
+            image: Input image (numpy array or PIL Image)
+            conf_threshold: Confidence threshold (0.0-1.0)
+            iou_threshold: IoU threshold for NMS (0.0-1.0)
+            max_detections: Maximum number of detections to return
+            
+        Returns:
+            List of detection dictionaries
+        """
+        try:
+            # Convert image if needed
+            if isinstance(image, Image.Image):
+                img = np.array(image)
+                logger.info(f"🖼️ PIL Image input: {img.shape}")
+            elif isinstance(image, np.ndarray):
+                img = image
+                logger.info(f"📊 NumPy array input: {img.shape}")
+            else:
+                raise ValueError(f"Unsupported image type: {type(image)}")
+            
+            original_h, original_w = img.shape[:2]
+            
+            # Run inference based on model type
+            if self.model_type == 'pt':
+                # PyTorch inference
+                results = self.model(img, conf=conf_threshold, iou=iou_threshold, max_det=max_detections)
+                result = results[0]  # Get first image result
+                
+                # Convert to common format
+                detections = []
+                for i, (box, mask) in enumerate(zip(result.boxes, result.masks if hasattr(result, 'masks') else [])):
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0])
+                    cls_id = int(box.cls[0])
+                    
+                    detection = {
+                        "id": f"det_{i}",
+                        "class_name": self.class_names.get(cls_id, f"class_{cls_id}"),
+                        "confidence": conf,
+                        "bbox": {
+                            "x1": int(x1), "y1": int(y1),
+                            "x2": int(x2), "y2": int(y2)
+                        },
+                        "mask": None,
+                        "image_size": {"width": original_w, "height": original_h}
+                    }
+                    
+                    # Add mask if available
+                    if hasattr(result, 'masks') and mask is not None:
+                        try:
+                            mask_data = mask.data[0].cpu().numpy()
+                            mask_binary = (mask_data > 0.5).astype(np.uint8) * 255
+                            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            if contours:
+                                largest = max(contours, key=cv2.contourArea)
+                                detection["mask"] = largest.reshape(-1, 2).tolist()
+                        except Exception as e:
+                            logger.warning(f"Mask generation failed: {e}")
+                    
+                    detections.append(detection)
+                
+                return detections
+                
+            else:
+                # ONNX inference (use existing ONNX code)
+                img_resized = cv2.resize(img, (640, 640))
+                img_norm = img_resized.astype(np.float32) / 255.0
+                img_batch = np.transpose(img_norm, (2, 0, 1))[None, ...]
+                
+                # Run inference
+                inference_start = time.time()
+                outputs = self.model.run(None, {self.input_name: img_batch})
+                inference_time = time.time() - inference_start
+                logger.info(f"⚡ ONNX inference time: {inference_time:.3f}s")
+                
+                # Process outputs (use existing ONNX processing code)
+                detections = outputs[0][0].T
+                boxes = detections[:, :4]
+                class_scores = detections[:, 4:84]
+                mask_coeffs_raw = detections[:, 84:]
+                mask_protos = outputs[1][0] if len(outputs) > 1 else None
+                
+                # Calculate confidences
+                class_scores_sigmoid = 1 / (1 + np.exp(-class_scores))
+                confidences = np.max(class_scores_sigmoid, axis=1)
+                class_ids = np.argmax(class_scores_sigmoid, axis=1)
+                
+                # Log confidence distribution
+                logger.info("🔍 CONFIDENCE SCORE ANALYSIS:")
+                logger.info(f"   Range: {np.min(confidences):.6f} to {np.max(confidences):.6f}")
+                logger.info(f"   Mean: {np.mean(confidences):.6f}")
+                logger.info(f"   Median: {np.median(confidences):.6f}")
+                logger.info(f"   Below 0.5: {np.sum(confidences < 0.5)} ({np.sum(confidences < 0.5)/len(confidences)*100:.2f}%)")
+                
+                # Filter by confidence
+                valid_indices = confidences > conf_threshold
+                if not valid_indices.any():
+                    return []
+                
+                valid_boxes = boxes[valid_indices]
+                valid_confidences = confidences[valid_indices]
+                valid_class_ids = class_ids[valid_indices]
+                valid_mask_coeffs = mask_coeffs_raw[valid_indices] if mask_coeffs_raw is not None else None
+                
+                # Convert coordinates
+                x_center, y_center, width, height = valid_boxes.T
+                scale_x, scale_y = original_w / 640, original_h / 640
+                
+                x1 = ((x_center - width / 2) * scale_x).astype(int)
+                y1 = ((y_center - height / 2) * scale_y).astype(int)
+                x2 = ((x_center + width / 2) * scale_x).astype(int)
+                y2 = ((y_center + height / 2) * scale_y).astype(int)
+                
+                # Apply NMS
+                boxes_for_nms = np.column_stack([x1, y1, x2, y2])
+                indices = cv2.dnn.NMSBoxes(
+                    boxes_for_nms.tolist(),
+                    valid_confidences.tolist(),
+                    score_threshold=0.0001,
+                    nms_threshold=iou_threshold
+                )
+                
+                if len(indices) == 0:
+                    return []
+                
+                indices = indices.flatten()
+                sorted_indices = sorted(indices, key=lambda i: valid_confidences[i], reverse=True)[:max_detections]
+                
+                # Create detections
+                detections = []
+                for i in sorted_indices:
+                    detection = {
+                        "id": f"det_{i}",
+                        "class_name": self.class_names.get(valid_class_ids[i], f"class_{valid_class_ids[i]}"),
+                        "confidence": float(valid_confidences[i]),
+                        "bbox": {
+                            "x1": int(x1[i]), "y1": int(y1[i]),
+                            "x2": int(x2[i]), "y2": int(y2[i])
+                        },
+                        "mask": None,
+                        "image_size": {"width": original_w, "height": original_h}
+                    }
+                    
+                    # Generate mask if available
+                    if valid_mask_coeffs is not None and mask_protos is not None:
+                        try:
+                            mask = np.dot(valid_mask_coeffs[i], mask_protos.reshape(-1, mask_protos.shape[-2] * mask_protos.shape[-1]))
+                            mask = mask.reshape(mask_protos.shape[-2:])
+                            mask = 1 / (1 + np.exp(-mask))
+                            mask = cv2.resize(mask, (original_w, original_h)) > 0.5
+                            
+                            contours, _ = cv2.findContours(
+                                (mask * 255).astype(np.uint8),
+                                cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE
+                            )
+                            
+                            if contours:
+                                largest = max(contours, key=cv2.contourArea)
+                                detection["mask"] = largest.reshape(-1, 2).tolist()
+                        except Exception as e:
+                            logger.warning(f"Mask generation failed: {e}")
+                    
+                    detections.append(detection)
+                
+                return detections
+            
+        except Exception as e:
+            logger.error(f"Prediction failed: {e}")
+            return []
     
-    def process_stream_frame(self, frame: np.ndarray, **kwargs) -> list:
-        """Process frame with adaptive optimization"""
-        if not self.should_process_frame():
-            return []  # Skip this frame
+    async def predict_stream(self, frame: np.ndarray, conf_threshold: float = 0.6,
+                           iou_threshold: float = 0.3, max_detections: int = 50) -> List[Dict]:
+        """Async prediction for streaming
         
-        start_time = time.time()
-        detections = self.model.fast_live_detect(frame, **kwargs)
-        self.last_process_time = time.time()
-        
-        process_time = self.last_process_time - start_time
-        if process_time > 0.033:  # >33ms = <30fps
-            logger.warning(f"⚠️ Slow processing: {process_time*1000:.1f}ms")
-        
-        return detections
+        Args:
+            frame: Input frame as numpy array
+            conf_threshold: Confidence threshold (0.0-1.0)
+            iou_threshold: IoU threshold for NMS (0.0-1.0)
+            max_detections: Maximum number of detections to return
+            
+        Returns:
+            List of detection dictionaries
+        """
+        # For now, just call predict() - we can optimize this later if needed
+        return self.predict(frame, conf_threshold, iou_threshold, max_detections) 
