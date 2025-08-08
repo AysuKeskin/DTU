@@ -147,7 +147,12 @@ class UnifiedModel:
                 
                 # Convert to common format
                 detections = []
-                for i, (box, mask) in enumerate(zip(result.boxes, result.masks if hasattr(result, 'masks') else [])):
+                masks = result.masks if hasattr(result, 'masks') else None
+                logger.info(f"PT: Found {len(result.boxes)} boxes, masks available: {masks is not None}")
+                if masks:
+                    logger.info(f"PT: Masks tensor shape: {masks.data.shape}")
+                
+                for i, box in enumerate(result.boxes):
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf[0])
                     cls_id = int(box.cls[0])
@@ -164,17 +169,43 @@ class UnifiedModel:
                         "image_size": {"width": original_w, "height": original_h}
                     }
                     
-                    # Add mask if available
-                    if hasattr(result, 'masks') and mask is not None:
+                    # Add mask if available - using same approach as ONNX model
+                    if masks is not None and i < len(masks.data):
                         try:
-                            mask_data = mask.data[0].cpu().numpy()
-                            mask_binary = (mask_data > 0.5).astype(np.uint8) * 255
-                            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            if contours:
-                                largest = max(contours, key=cv2.contourArea)
-                                detection["mask"] = largest.reshape(-1, 2).tolist()
+                            logger.info(f"PT: Processing mask {i}")
+                            # Get mask data for this detection
+                            mask_data = masks.data[i].cpu().numpy()
+                            logger.info(f"PT: Mask {i} shape: {mask_data.shape}, min: {mask_data.min():.3f}, max: {mask_data.max():.3f}")
+                            
+                            # Resize mask to original image size
+                            mask_resized = cv2.resize(mask_data, (original_w, original_h))
+                            logger.info(f"PT: Mask {i} resized to: {mask_resized.shape}")
+                            
+                            # Get mask for bbox region only - same as ONNX approach
+                            y1_int, y2_int = max(0, int(y1)), min(original_h, int(y2))
+                            x1_int, x2_int = max(0, int(x1)), min(original_w, int(x2))
+                            mask_roi = mask_resized[y1_int:y2_int, x1_int:x2_int] > 0.5
+                            logger.info(f"PT: ROI shape: {mask_roi.shape}, any True: {mask_roi.any()}")
+                            
+                            if mask_roi.size > 0 and mask_roi.any():
+                                # Find contours - same as ONNX approach
+                                cnts, _ = cv2.findContours(
+                                    (mask_roi * 255).astype(np.uint8),
+                                    cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE
+                                )
+                                logger.info(f"PT: Found {len(cnts)} contours")
+                                
+                                if cnts:
+                                    # Get largest contour and offset by bbox coordinates - same as ONNX
+                                    largest = max(cnts, key=cv2.contourArea)
+                                    pts = (largest + [x1_int, y1_int]).reshape(-1, 2).tolist()
+                                    detection["mask"] = pts
+                                    logger.info(f"PT: Generated mask with {len(pts)} points")
                         except Exception as e:
-                            logger.warning(f"Mask generation failed: {e}")
+                            logger.warning(f"PT mask generation failed: {e}")
+                            import traceback
+                            logger.warning(f"PT mask error details: {traceback.format_exc()}")
                     
                     detections.append(detection)
                 
@@ -303,3 +334,74 @@ class UnifiedModel:
         """
         # For now, just call predict() - we can optimize this later if needed
         return self.predict(frame, conf_threshold, iou_threshold, max_detections) 
+
+    def _results_to_detections(self, result, frame_w: int, frame_h: int) -> List[Dict]:
+        """Convert a single Ultralytics Results object to our detection dicts with optional masks and track ids."""
+        detections: List[Dict] = []
+        boxes = result.boxes
+        masks = result.masks if hasattr(result, 'masks') else None
+        ids = None
+        try:
+            ids = boxes.id.cpu().numpy() if hasattr(boxes, 'id') and boxes.id is not None else None
+        except Exception:
+            ids = None
+        for i in range(len(boxes)):
+            xyxy = boxes.xyxy[i].cpu().numpy()
+            x1, y1, x2, y2 = [int(v) for v in xyxy]
+            conf = float(boxes.conf[i].cpu().numpy())
+            cls_id = int(boxes.cls[i].cpu().numpy())
+            det: Dict = {
+                "id": f"track_{int(ids[i])}" if ids is not None else f"det_{i}",
+                "class_name": self.class_names.get(cls_id, f"class_{cls_id}"),
+                "confidence": conf,
+                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                "mask": None,
+                "image_size": {"width": frame_w, "height": frame_h},
+            }
+            # Optional mask
+            if masks is not None and i < len(masks.data):
+                try:
+                    mask_data = masks.data[i].cpu().numpy()
+                    mask_resized = cv2.resize(mask_data, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                    mask_roi = mask_resized[y1:y2, x1:x2] > 0.5
+                    if mask_roi.size > 0 and mask_roi.any():
+                        cnts, _ = cv2.findContours((mask_roi * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if cnts:
+                            largest = max(cnts, key=cv2.contourArea)
+                            pts = (largest + [x1, y1]).reshape(-1, 2).tolist()
+                            det["mask"] = pts
+                except Exception:
+                    pass
+            detections.append(det)
+        return detections
+
+    def track_video(self, video_path: str, conf_threshold: float = 0.5, iou_threshold: float = 0.3,
+                    tracker_yaml: Optional[str] = None, vid_stride: int = 1, max_frames: Optional[int] = None) -> List[List[Dict]]:
+        """Run ByteTrack tracking on a video file and return per-frame detections.
+        Uses Ultralytics YOLO.track with stream=True for incremental processing.
+        """
+        if self.model_type != 'pt':
+            raise RuntimeError("track_video is only supported for PyTorch models")
+        # Choose tracker config
+        tracker_cfg = tracker_yaml or 'bytetrack.yaml'
+        # Run tracking stream
+        results_gen = self.model.track(
+            source=video_path,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            tracker=tracker_cfg,
+            stream=True,
+            vid_stride=max(1, int(vid_stride)),
+            persist=True,
+            verbose=False,
+        )
+        per_frame: List[List[Dict]] = []
+        frame_idx = 0
+        for r in results_gen:
+            frame_h, frame_w = int(r.orig_shape[0]), int(r.orig_shape[1])
+            dets = self._results_to_detections(r, frame_w, frame_h)
+            per_frame.append(dets)
+            frame_idx += 1
+            if max_frames is not None and frame_idx >= max_frames:
+                break
+        return per_frame 

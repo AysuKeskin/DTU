@@ -14,6 +14,10 @@ import asyncio
 import json
 import queue
 from threading import Thread
+from typing import Union
+from fastapi.staticfiles import StaticFiles
+import subprocess
+import uuid
 
 # Import our modules
 from app.onnx_model_simple import SimpleONNXModel
@@ -74,6 +78,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Create and mount media directory for serving transcoded videos
+MEDIA_DIR = os.path.join(os.path.dirname(__file__), 'media')
+os.makedirs(MEDIA_DIR, exist_ok=True)
+app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 
 # =============================================================================
 # DATA MODELS (Pydantic schemas)
@@ -932,114 +941,123 @@ async def detect_video(
     file: UploadFile = File(...),
     confidence: float = 0.5,
     max_frames: int = 100,
-    frame_interval: int = 30,  # Process every Nth frame
-    motion_threshold: int = 25,  # Threshold for motion detection
-    min_motion_area: int = 500,  # Minimum area for motion regions
-    keyframe_interval: int = 5  # Run full detection every N frames
+    frame_interval: int = 3,  # Process every Nth frame (vid_stride)
+    motion_threshold: int = 25,
+    min_motion_area: int = 500,
+    keyframe_interval: int = 5
 ):
-    """
-    VIDEO DETECTION ENDPOINT
-    =======================
-    Handles video file upload and frame-by-frame detection with optimizations:
-    - Motion detection to identify regions of interest
-    - Selective YOLO inference on motion regions
-    - Full frame detection on keyframes
-    - Object tracking between frames
-    """
     try:
         start_time = time.time()
         logger.info(f"🎬 Starting optimized video detection for: {file.filename}")
         
-        # Check if model is loaded
         if model is None:
             logger.error("❌ No model loaded!")
             raise HTTPException(status_code=500, detail="No model loaded")
         
-        # Initialize video processor
-        video_processor = VideoProcessor(
-            model=model,
-            confidence_threshold=confidence,
-            motion_threshold=motion_threshold,
-            min_motion_area=min_motion_area,
-            keyframe_interval=keyframe_interval
-        )
-        
         # Save uploaded video to temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as temp_file:
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1] or '.mp4') as temp_file:
             contents = await file.read()
             temp_file.write(contents)
             temp_video_path = temp_file.name
         
+        # Open for metadata
+        cap = cv2.VideoCapture(temp_video_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Could not open video file")
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration = total_frames / fps if fps and fps > 0 else 0
+        cap.release()
+        
+        video_info = {
+            "total_frames": total_frames,
+            "fps": fps,
+            "width": width,
+            "height": height,
+            "duration_seconds": duration
+        }
+        
+        # Transcode to browser-safe MP4 (H.264/AAC) with faststart (works for MP4, WebM, AVI, etc.)
+        output_filename = f"{uuid.uuid4().hex}.mp4"
+        output_path = os.path.join(MEDIA_DIR, output_filename)
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", temp_video_path,
+            # Normalize frame rate if missing
+            "-r", str(fps if fps and fps > 0 else 30),
+            # Video
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+            "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1",
+            # Audio (handle streams without audio)
+            "-c:a", "aac", "-b:a", "160k",
+            "-movflags", "+faststart",
+            output_path
+        ]
         try:
-            # Open video with OpenCV
+            subprocess.run(ffmpeg_cmd, check=True)
+            playback_url = f"/media/{output_filename}"
+            logger.info(f"✅ Transcoded video available at {playback_url}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"FFmpeg transcode failed: {e}")
+            playback_url = None
+        
+        detections_per_frame: List[List[Detection]] = []  # type: ignore
+        processed_frames = 0
+        
+        # If PT model, use built-in tracker with ByteTrack and vid_stride (frame skipping)
+        if isinstance(model, UnifiedModel):
+            logger.info("🧠 Using PyTorch YOLO.track with ByteTrack for video processing")
+            per_frame = model.track_video(
+                video_path=temp_video_path,
+                conf_threshold=confidence,
+                iou_threshold=0.3,
+                tracker_yaml='bytetrack.yaml',
+                vid_stride=max(1, int(frame_interval)),
+                max_frames=max_frames,
+            )
+            detections_per_frame = per_frame
+            processed_frames = len(per_frame)
+        else:
+            # Fallback to existing ONNX-based processor
+            logger.info("🧠 Using ONNX VideoProcessor fallback for video processing")
+            vp = VideoProcessor(
+                onnx_model=model,
+                confidence_threshold=confidence,
+                motion_threshold=motion_threshold,
+                min_motion_area=min_motion_area,
+                keyframe_interval=keyframe_interval,
+            )
             cap = cv2.VideoCapture(temp_video_path)
-            if not cap.isOpened():
-                raise HTTPException(status_code=400, detail="Could not open video file")
-            
-            # Get video info
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            duration = total_frames / fps if fps > 0 else 0
-            
-            video_info = {
-                "total_frames": total_frames,
-                "fps": fps,
-                "width": width,
-                "height": height,
-                "duration_seconds": duration
-            }
-            
-            logger.info(f"📹 Video info: {total_frames} frames, {fps:.2f} FPS, {width}x{height}, {duration:.2f}s")
-            
-            # Calculate frames to process
             frames_to_process = min(max_frames, total_frames)
-            logger.info(f"🎯 Will process up to {frames_to_process} frames with optimized detection")
-            
-            detections_per_frame = []
-            processed_frames = 0
-            
             while processed_frames < frames_to_process:
+                # Skip frames according to frame_interval
+                if frame_interval > 1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, processed_frames * frame_interval)
                 ret, frame = cap.read()
                 if not ret:
                     break
-                
-                # Process frame with our optimized strategy
-                frame_detections = video_processor.process_frame(frame)
-                detections_per_frame.append(frame_detections)
+                frame_dets = vp.process_frame(frame)
+                detections_per_frame.append(frame_dets)
                 processed_frames += 1
-                    
-                # Log progress periodically
-                if processed_frames % 10 == 0:
-                    logger.info(f"📊 Processed {processed_frames}/{frames_to_process} frames - Found {len(frame_detections)} tracked objects")
-            
             cap.release()
-            processing_time = time.time() - start_time
-            
-            # Count total detections
-            total_detections = sum(len(frame_dets) for frame_dets in detections_per_frame)
-            logger.info(f"✅ Video processing complete: {processed_frames} frames, {total_detections} total detections in {processing_time:.2f}s")
-            
-            return VideoDetectionResponse(
-                total_frames=total_frames,
-                processed_frames=processed_frames,
-                detections_per_frame=detections_per_frame,
-                processing_time=processing_time,
-                model_version=current_model_name or "Unknown",
-                video_info=video_info
-            )
-            
-        finally:
-            # Clean up temporary file
-            try:
-                os.unlink(temp_video_path)
-            except:
-                pass
-                
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            "total_frames": total_frames,
+            "processed_frames": processed_frames,
+            "detections_per_frame": detections_per_frame,
+            "processing_time": processing_time,
+            "model_version": current_model_name or "unknown",
+            "video_info": video_info,
+            "playback_url": playback_url,
+        }
     except Exception as e:
         logger.error(f"❌ Video detection failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Video processing failed: {str(e)}")
+        raise
 
 async def detection_worker():
     """Background worker that processes frames and runs model detection"""
